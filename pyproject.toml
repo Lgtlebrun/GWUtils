@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "GWUtils"
+version = "0.1.0"
+description = "Helper package to handle GW Events with GraceDB"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+    {name = "Leonard Lebrun", email = "leonard.lebrun@physik.uzh.ch"}
+]
+keywords = ["astronomy", "alerts", "GW", "gravitational-waves", "gracedb"]
+
+# Core dependencies required for the package to work
+# Use flexible version constraints (>=) to allow pip to resolve versions
+dependencies = [
+    "numpy>=1.20.0",
+    "astropy>=5.0",
+    "pandas>=1.3.0",
+    "pydantic>=2.0",
+    "ligo-gracedb>=2.0",
+    "healpy>=1.16.0",
+    "requests>=2.28.0",
+]
+
+# Optional dependency groups
+[project.optional-dependencies]
+# Development tools
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=3.0",
+    "black>=22.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+    "ipython>=8.0",
+    "ipdb>=0.13",
+]
+
+# Visualization and plotting
+viz = [
+    "matplotlib>=3.5",
+    "seaborn>=0.12",
+    "ligo.skymap>=1.0",
+]
+
+# Everything (all optional dependencies)
+all = [
+    "alert_monitor[dev,docs,viz]",
+]
+
+# Project URLs
+[project.urls]
+Homepage = "https://github.com/yourusername/alert_monitor"
+Documentation = "https://alert-monitor.readthedocs.io"
+Repository = "https://github.com/yourusername/alert_monitor"
+"Bug Tracker" = "https://github.com/yourusername/alert_monitor/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = false
+
+[tool.setuptools.package-data]
+alert_monitor = ["py.typed", "*.json", "*.yaml"]
