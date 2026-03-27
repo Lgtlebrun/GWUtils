@@ -24,6 +24,9 @@ dependencies = [
     "ligo-gracedb>=2.0",
     "healpy>=1.16.0",
     "requests>=2.28.0",
+    "ligo",
+    "ligo.skymap",
+    "gwosc",
 ]
 
 # Optional dependency groups
@@ -48,19 +51,10 @@ viz = [
 
 # Everything (all optional dependencies)
 all = [
-    "alert_monitor[dev,docs,viz]",
+    "GWUtils[dev,viz]",
 ]
-
-# Project URLs
-[project.urls]
-Homepage = "https://github.com/yourusername/alert_monitor"
-Documentation = "https://alert-monitor.readthedocs.io"
-Repository = "https://github.com/yourusername/alert_monitor"
-"Bug Tracker" = "https://github.com/yourusername/alert_monitor/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 namespaces = false
 
-[tool.setuptools.package-data]
-alert_monitor = ["py.typed", "*.json", "*.yaml"]
