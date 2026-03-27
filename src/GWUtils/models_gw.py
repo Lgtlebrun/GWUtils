@@ -151,7 +151,7 @@ class GWEvent(BaseModel):
     model_config: ClassVar = {"extra": "ignore"}
 
     skymap_priorities_map: ClassVar = {
-        'CBC': ['Bilby', 'bayestar'],
+        'CBC': ['gw', 'Bilby', 'bayestar'],
         'Burst': ['cwb', 'cwb.LHV']
     }
 
@@ -222,8 +222,8 @@ class GWEvent(BaseModel):
     def from_gwosc(cls, gw_name: str) -> "GWEvent":
         """Construct directly from a GWOSC catalog name, no GraceDB needed."""
         # Lazy import to avoid circular import
-        from .query_utils import query_latest_gwtc
-        res = query_latest_gwtc(gw_name)
+        from .query_utils import query_latest_gwtc_dataset
+        res = query_latest_gwtc_dataset(gw_name)
         if len(res) != 1 :
             raise ValueError(f"Expected one answer, had {res} of length {len(res)}")
         
@@ -326,6 +326,8 @@ class GWEvent(BaseModel):
                 if pipelines is not None:
                     dl_success = False
                     for pipeline in pipelines:
+                        if pipeline == 'gw':
+                            pipeline = f"gw{self.superevent_id[1:]}_skymap" # e.g. gw190425z_skymap
                         skymap_url = f"https://gracedb.ligo.org/api/superevents/{self.superevent_id}/files/{pipeline}.multiorder.fits"
                         filename = Path(SKYMAP_FITS_DIRECTORY) / f"{self.superevent_id}_{pipeline}.fits"
                         try:
@@ -527,14 +529,17 @@ class GWTCEvent(GWEvent):
     """
     A GWEvent instantiated directly from a GWTC catalog name.
     Merges GWOSC catalog parameters with GraceDB superevent data.
-    
     Usage:
         ev = GWTCEvent("GW230627_015337")
+        evs = GWTCEvent(["GW230627_015337", "GW230919_215712"])
     """
-
-    def __new__(cls, gw_name: str, client=None, classification: bool = True):
+    def __new__(cls, gw_name: str | list[str], client=None, classification: bool = True):
+        if isinstance(gw_name, list):
+            return [
+                _build_gwevent_from_gw_name(name, client=client, classification=classification)
+                for name in gw_name
+            ]
         return _build_gwevent_from_gw_name(gw_name, client=client, classification=classification)
-
 
 if __name__ == "__main__":
 

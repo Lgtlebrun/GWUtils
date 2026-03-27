@@ -46,12 +46,14 @@ from GWUtils.models_gw import GWTCEvent
 events = ["GW230627_015337", "GW230919_215712", "GW230922_020344", "GW231206_233901", "GW231226_101520"]
 gwevents = [GWTCEvent(ev) for ev in events]
 ```
+N.B. : GWUtils will download skymaps locally to your computer when not already available, and will preferentially fetch the skymap from there if existing.
 
 you can also create a multi-rows dataframe directly via :
 ```python
 from GWUtils.models_gw import to_dataframe
 df = to_dataframe(gwevents)
 ```
+
 
 ### Events from GWTC
 The ```gwosc``` package allows to fetch from the GWOSC database, especially from the GWTC catalog. 

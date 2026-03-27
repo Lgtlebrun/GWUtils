@@ -1,5 +1,5 @@
 from ligo.gracedb.rest import GraceDb
-from .models_gw import GWEvent, CBCClassification, is_classification_json
+from .models_gw import GWEvent, GWTCEvent, CBCClassification, is_classification_json
 from urllib import request
 import re
 from collections import defaultdict
@@ -101,27 +101,57 @@ def query_cbc(query: str, client=None, classification: bool = True, enrich: bool
 
     return superevents
 
-def query_latest_gwtc(query: str = None) -> list[str]:
-    all_datasets = datasets.find_datasets(type='event')
-    gw_datasets = [gw for gw in all_datasets if gw.startswith('GW')]
-    
-    # If a query is provided, filter to datasets matching the event name
-    if query is not None:
-        gw_datasets = [gw for gw in gw_datasets if gw.startswith(query)]
-
-    def _keep_latest_versions(items):
-        latest = {}
-        for item in items:
-            parts = item.rsplit('-v', 1)
-            if len(parts) == 2 and parts[1].isdigit():
-                name, version = parts[0], int(parts[1])
-                if name not in latest or version > latest[name]:
-                    latest[name] = version
-            else:
-                latest[item] = None
-        return [
-            f"{name}-v{ver}" if ver is not None else name
-            for name, ver in latest.items()
-        ]
+def query_latest_gwtc_dataset(query: str | list[str] | None = None) -> list[str]:
+    if query is None:
+        all_datasets = datasets.find_datasets(type='event')
+        gw_datasets = [gw for gw in all_datasets if gw.startswith('GW')]
+    elif isinstance(query, list):
+        all_datasets = datasets.query_events(select=query)
+        gw_datasets = [gw for gw in all_datasets if gw.startswith('GW')]
+    elif query.startswith("GW"):
+        all_datasets = datasets.find_datasets(type='event')
+        gw_datasets = [gw for gw in all_datasets if gw.startswith(query)]
+    else:
+        all_datasets = datasets.query_events(select=query)
+        gw_datasets = [gw for gw in all_datasets if gw.startswith('GW')]
 
     return _keep_latest_versions(gw_datasets)
+
+def query_gwtc_events(query: str | list[str] | None = None, client=None, classification: bool = True) -> list[GWEvent]:
+    """Query GWTC and return fully built GWTCEvent objects, deduplicated by superevent_id."""
+    from .models_gw import GWTCEvent
+    names = query_latest_gwtc_dataset(query)
+    events = GWTCEvent(names, client=client, classification=classification)
+    
+    # Deduplicate by superevent_id, keeping the one with the most GWOSC data
+    seen = {}
+    for ev in events:
+        sid = ev.superevent_id
+        if sid not in seen:
+            seen[sid] = ev
+        else:
+            # Prefer the one with more fields populated
+            existing = seen[sid]
+            if _count_populated(ev) > _count_populated(existing):
+                seen[sid] = ev
+    
+    return list(seen.values())
+
+def _count_populated(ev: GWEvent) -> int:
+    """Count non-None fields as a proxy for data richness."""
+    return sum(1 for v in ev.model_fields if getattr(ev, v) is not None)
+
+def _keep_latest_versions(items: list[str]) -> list[str]:
+    latest = {}
+    for item in items:
+        parts = item.rsplit('-v', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            name, version = parts[0], int(parts[1])
+            if name not in latest or version > latest[name]:
+                latest[name] = version
+        else:
+            latest[item] = None
+    return [
+        f"{name}-v{ver}" if ver is not None else name
+        for name, ver in latest.items()
+    ]
