@@ -4,11 +4,14 @@ import datetime
 
 client = GraceDb()
 
+
 def test_validate_gw_event():
-    sid_exs = ['S250328ae']
+    sid_exs = ["S250328ae"]
 
     for sid in sid_exs:
-        (gwevent_data,) = client.superevents(sid) # To get rid of iterator, only one event expectd from query
+        (gwevent_data,) = client.superevents(
+            sid
+        )  # To get rid of iterator, only one event expectd from query
 
         gwevent = GWEvent.model_validate(gwevent_data)
         assert gwevent.superevent_id == sid
