@@ -2,11 +2,14 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict, PrivateAttr
 from typing import List, Optional, ClassVar, Any
 from pathlib import Path
 import datetime
+import json
+import re
+import socket
 from enum import Enum
 from astropy.time import Time
 from urllib.request import urlretrieve
 from .define import SKYMAP_FITS_DIRECTORY, EVENTS_DIRECTORY
-from ligo.gracedb.rest import GraceDb
+from ligo.gracedb.rest import GraceDb, HTTPError
 from ligo.skymap.io import fits
 from ligo.skymap.postprocess import find_greedy_credible_levels
 import astropy_healpix as ah
@@ -21,6 +24,23 @@ import ligo.skymap.plot
 from astropy.visualization.wcsaxes import SphericalCircle
 from astropy.coordinates import SkyCoord
 import pandas as pd
+from mocpy import MOC
+from contextlib import contextmanager
+
+# GraceDB/GWOSC calls below don't set a socket timeout themselves, so on a
+# filtered/dead network they hang indefinitely instead of raising a fast
+# ConnectionError. Bound them so the offline-cache fallback actually kicks in.
+NETWORK_TIMEOUT_SECONDS = 10
+
+
+@contextmanager
+def _bounded_network_timeout(seconds: float = NETWORK_TIMEOUT_SECONDS):
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(previous)
 
 
 class Detector(Enum):
@@ -107,65 +127,108 @@ class GWEvent(BaseModel):
     but probably the cwb.multiorder.fits skymap is, and should be used instead.
     """
 
-    # ── Identity ──────────────────────────────────────────────────────────────
-    superevent_id: str
+    # Identity 
+    superevent_id: Optional[str] = None
     gw_id: Optional[str] = None
     catalog: Optional[str] = None
 
-    # ── Timing ────────────────────────────────────────────────────────────────
+    # Timing 
     created: Optional[datetime.datetime] = None
     t_start: Optional[datetime.datetime] = None
     t_end: Optional[datetime.datetime] = None
     t_0: Optional[datetime.datetime] = None
     gps: Optional[float] = None
 
-    # ── Detectors & pipeline ──────────────────────────────────────────────────
+    # Detectors & pipeline
     detectors: List[Detector] = []
     group: Optional[str] = None
     preferred_event: Optional[str] = None
     network_snr: Optional[float] = None
 
-    # ── Rates ─────────────────────────────────────────────────────────────────
+    # Rates
     far: Optional[float] = None
     p_astro: Optional[float] = None
 
-    # ── Status flags ──────────────────────────────────────────────────────────
+    # Status flags 
     skymap_ready: bool = False
     pastro_ready: bool = False
 
-    # ── Classification ────────────────────────────────────────────────────────
+    # Classification
     classification: Optional[CBCClassification] = None
 
-    # ── Masses [M_sun] ────────────────────────────────────────────────────────
+    # Masses [M_sun] 
     mass_1: Optional[UncertainQuantity] = None
     mass_2: Optional[UncertainQuantity] = None
     chirp_mass: Optional[UncertainQuantity] = None
     total_mass: Optional[UncertainQuantity] = None
     final_mass: Optional[UncertainQuantity] = None
 
-    # ── Distance & cosmology ──────────────────────────────────────────────────
+    # Distance & cosmology
     luminosity_distance: Optional[UncertainQuantity] = None  # [Mpc]
     redshift: Optional[UncertainQuantity] = None
 
-    # ── Spins ─────────────────────────────────────────────────────────────────
+    # Spins 
     chi_eff: Optional[UncertainQuantity] = None
 
-    # ── metadata ───────────────────────────────────────────────────────────
+    # metadata
     preferred_waveform: Optional[str] = None
     posterior_url: Optional[str] = None
     strain_files: Optional[list[dict]] = None
 
-    # ── Skymap ────────────────────────────────────────────────────────────────
+    # Skymap 
     skymap_path: Optional[str | Path] = None
     _skymap: Optional[Any] = PrivateAttr(default=None)
     _meta: Optional[Any] = PrivateAttr(default=None)
 
     model_config: ClassVar = {"extra": "ignore"}
 
+    # Suffixes of actual GraceDB filenames, in order of preference. Matched
+    # with `str.endswith`, so e.g. "PublicationSamples.multiorder.fits" also
+    # matches event-specific names like "GW190503_185404_PublicationSamples.multiorder.fits".
+    # Older (O1-O3a) events often only have a flat bayestar.fits(.gz), no
+    # Bilby/LALInference multiorder file, hence the long fallback chain.
     skymap_priorities_map: ClassVar = {
-        "CBC": ["gw", "Bilby", "bayestar"],
-        "Burst": ["cwb", "cwb.LHV"],
+        "CBC": [
+            "Bilby.multiorder.fits",
+            "LALInference.multiorder.fits",
+            "LALInference.offline.multiorder.fits",
+            "PublicationSamples.multiorder.fits",
+            "bayestar.multiorder.fits",
+            "bayestar.fits.gz",
+            "bayestar.fits",
+        ],
+        "Burst": [
+            "cwb.multiorder.fits",
+            "cwb.LHV.multiorder.fits",
+            "cwb.fits.gz",
+            "cwb.fits",
+        ],
     }
+
+    # O1/O2 events predate GraceDB's skymap distribution; LVC released their
+    # skymaps separately as LIGO-P1800381 (https://dcc.ligo.org/LIGO-P1800381).
+    gwtc1_skymap_url: ClassVar = (
+        "https://dcc.ligo.org/public/0157/P1800381/007/{name}_skymap.fits.gz"
+    )
+
+    def __new__(cls, *args, **kwargs):
+        """Allow `GWEvent(identifier)` as a shorthand fetch: a bare string is
+        resolved to a GWTCEvent (GWTC catalog name, e.g. 'GW170817') or a
+        GWEvent (GraceDB superevent ID, e.g. 'S250328ae'). Regular field-kwarg
+        construction and model_validate() are unaffected.
+
+        Pass `offline=True` to skip GraceDB/GWOSC entirely and load the event
+        from the local JSON cache written by `.save()` instead. Even with the
+        default `offline=False`, a network failure (no connection, DNS, etc.)
+        transparently falls back to that same cache when available."""
+        if len(args) == 1 and isinstance(args[0], str):
+            return _build_from_identifier(args[0], **kwargs)
+        return super().__new__(cls)
+
+    def __init__(self, *args, **kwargs):
+        if len(args) == 1 and isinstance(args[0], str):
+            return  # already fully built in __new__
+        super().__init__(*args, **kwargs)
 
     @field_validator("detectors", mode="before")
     def validate_detectors(cls, v):
@@ -244,11 +307,12 @@ class GWEvent(BaseModel):
         # Lazy import to avoid circular import
         from .query_utils import query_latest_gwtc_dataset
 
-        res = query_latest_gwtc_dataset(gw_name)
-        if len(res) != 1:
-            raise ValueError(f"Expected one answer, had {res} of length {len(res)}")
+        if '-v' not in gw_name :     # Avoid case where version is already indicated
+            res = query_latest_gwtc_dataset(gw_name)
+            if len(res) != 1:
+                raise ValueError(f"Expected one answer, had {res} of length {len(res)}")
 
-        gw_name = res[0]
+            gw_name = res[0]
 
         ev = fetch_event_json(gw_name)
         events = ev.get("events", {})
@@ -326,12 +390,31 @@ class GWEvent(BaseModel):
             pastro_ready=False,
         )
 
+    def _resolve_gwtc_name(self) -> Optional[str]:
+        """Find the GWTC catalog name matching this event's coalescence time.
+
+        GWOSC has no lookup by GraceDB superevent ID, so for events built
+        from a bare superevent ID (no gw_id known yet) we match on GPS time
+        instead, via `find_datasets`'s `segment` filter.
+        """
+        if self.t_0 is None:
+            return None
+        gps = Time(self.t_0).gps
+        candidates = datasets.find_datasets(type="event", segment=(gps - 1, gps + 1))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: int(c.rsplit("-v", 1)[1]) if "-v" in c else 0)
+        return candidates[-1]
+
     def enrich_from_gwosc(self) -> "GWEvent":
         """
         Overlay catalog-quality GWOSC parameters onto a GraceDB-sourced event.
         Preserves GraceDB identity, timing, skymap status, and classification.
         """
-        name = self.gw_id or self.superevent_id
+        name = self.gw_id or self._resolve_gwtc_name()
+        if name is None:
+            print(f"debug : no GWOSC catalog match found for {self.superevent_id}")
+            return self
         try:
             enriched = GWEvent.from_gwosc(name)
             pe_fields = [
@@ -364,48 +447,81 @@ class GWEvent(BaseModel):
         """Check if the skymap has already been downloaded locally."""
         if self.skymap_path is not None and Path(self.skymap_path).exists():
             return Path(self.skymap_path)
-        matching = list(Path(SKYMAP_FITS_DIRECTORY).glob(f"{self.superevent_id}*.fits"))
+        matching = sorted(Path(SKYMAP_FITS_DIRECTORY).glob(f"{self.identifier}*.fits*"))
         if matching:
             return matching[0]
         return False
 
+    def _is_gwtc1_event(self) -> bool:
+        """O1/O2 (GWTC-1) events have no GraceDB superevent or skymap."""
+        return bool(self.gw_id) and bool(self.catalog) and self.catalog.startswith("GWTC-1")
+
+    def _download_gwtc1_skymap(self):
+        """Fetch the skymap from the public GWTC-1 data release (LIGO-P1800381),
+        since these events were never assigned a GraceDB superevent/skymap."""
+        remote_name = re.sub(r"-v\d+$", "", self.gw_id)
+        url = self.gwtc1_skymap_url.format(name=remote_name)
+        filename = Path(SKYMAP_FITS_DIRECTORY) / f"{self.identifier}_skymap.fits.gz"
+        try:
+            urlretrieve(url, filename)
+            print(f"Skymap downloaded successfully from: {url}")
+            self.skymap_path = filename
+            self.save()
+            return filename
+        except Exception as e:
+            print(f"Failed to download GWTC-1 skymap from: {url}. Error: {e}")
+
+    def _best_skymap_filename(self, available: list[str]) -> Optional[str]:
+        """Pick the best skymap filename actually present, by group priority."""
+        if self.group is None:
+            return None
+        patterns = GWEvent.skymap_priorities_map.get(self.group)
+        if patterns is None:
+            return None
+        for pattern in patterns:
+            for filename in available:
+                if filename.endswith(pattern):
+                    return filename
+        return None
+
     def download_skymap(self):
-        if self.skymap_ready:
-            if self.group is not None:
-                pipelines = GWEvent.skymap_priorities_map.get(self.group)
-                if pipelines is not None:
-                    dl_success = False
-                    for pipeline in pipelines:
-                        if pipeline == "gw":
-                            pipeline = f"gw{self.superevent_id[1:]}_skymap"  # e.g. gw190425z_skymap
-                        skymap_url = f"https://gracedb.ligo.org/api/superevents/{self.superevent_id}/files/{pipeline}.multiorder.fits"
-                        filename = (
-                            Path(SKYMAP_FITS_DIRECTORY)
-                            / f"{self.superevent_id}_{pipeline}.fits"
-                        )
-                        try:
-                            urlretrieve(skymap_url, filename)
-                            print(f"Skymap downloaded successfully from: {skymap_url}")
-                            dl_success = True
-                            self.skymap_path = filename
-                            return filename
-                        except Exception as e:
-                            print(
-                                f"Failed to download skymap from: {skymap_url}. Error: {e}"
-                            )
-                        print(f"Attempting to download skymap from: {skymap_url}")
-                    if not dl_success:
-                        print(
-                            f"Failed to download skymap from all pipelines for group {self.group}."
-                        )
-                else:
-                    print(
-                        f"No known skymap pipelines for group {self.group}. Cannot determine skymap URL."
-                    )
-            else:
-                print("Group information is missing. Cannot determine skymap URL.")
-        else:
+
+        if self._is_gwtc1_event():
+            return self._download_gwtc1_skymap()
+
+        if not self.skymap_ready:
             print("Skymap is not ready. Cannot download skymap.")
+            return
+        if self.group is None:
+            print("Group information is missing. Cannot determine skymap URL.")
+            return
+
+        client = GraceDb()
+        try:
+            available = list(client.files(self.superevent_id).json().keys())
+        except Exception as e:
+            print(f"Failed to list files for {self.superevent_id}: {e}")
+            return
+
+        filename = self._best_skymap_filename(available)
+        if filename is None:
+            print(
+                f"No matching skymap file for group {self.group} among: {available}"
+            )
+            return
+
+        # Use the authenticated client (not a bare urlretrieve) since most
+        # GraceDB file downloads require LIGO.ORG credentials.
+        local_path = Path(SKYMAP_FITS_DIRECTORY) / f"{self.superevent_id}_{filename}"
+        try:
+            with open(local_path, "wb") as f:
+                f.write(client.files(self.superevent_id, filename).read())
+            print(f"Skymap downloaded successfully: {filename}")
+            self.skymap_path = local_path
+            self.save()
+            return local_path
+        except Exception as e:
+            print(f"Failed to download skymap file {filename}: {e}")
 
     def load_skymap(self):
         if self._skymap is None:
@@ -491,6 +607,74 @@ class GWEvent(BaseModel):
             "radius_deg": np.rad2deg(radius_max),
         }
 
+    def _credible_moc(self, percentile: float, n_vertices: int) -> tuple[MOC, int]:
+        """Build the exact credible-region MOC, then coarsen it just enough
+        for its boundary to have at most `n_vertices` vertices in total.
+
+        MOC coarsening only ever grows a region (a coarse cell is kept whole
+        as soon as any of its finer sub-cells belongs to the MOC), so the
+        returned region is always a superset of the true credible area,
+        never an underestimate, no matter how small `n_vertices` is.
+        """
+        skymap, _ = self.load_skymap()
+        nside = ah.npix_to_nside(len(skymap))
+        level = ah.nside_to_level(nside)
+
+        ipix_nest = hp.ring2nest(nside, np.arange(len(skymap)))
+        uniq = ah.level_ipix_to_uniq(level, ipix_nest)
+
+        moc = MOC.from_valued_healpix_cells(
+            uniq.astype(np.uint64),
+            skymap.astype(np.float64),
+            max_depth=level,
+            cumul_to=percentile / 100.0,
+        )
+
+        for order in range(level, -1, -1):
+            n_boundary = sum(len(c) for c in moc.get_boundaries(order=order))
+            if n_boundary <= n_vertices or order == 0:
+                return moc.degrade_to_order(order), order
+
+    def get_roi(self, percentile: float = 90, n_vertices: int = 20, format: str = "dict"):
+        """Region of interest (credible region) for this event.
+
+        Built as an exact MOC (mocpy) from the skymap, then coarsened so its
+        boundary has at most `n_vertices` points — coarsening always grows
+        the region rather than shrinking it (see `_credible_moc`), so the
+        returned area is never an underestimate of the true `percentile`%
+        credible region.
+
+        Parameters
+        ----------
+        percentile : float
+            Credible level in percent (e.g. 90 for the 90% credible region).
+        n_vertices : int
+            Target maximum number of boundary vertices, summed across all
+            disjoint contours.
+        format : {'dict', 'moc'}
+            'dict' returns a JSON-friendly summary with the boundary contours
+            (ra/dec in degrees); 'moc' returns the `mocpy.MOC` object itself.
+        """
+        if format not in ("dict", "moc"):
+            raise ValueError(f"format must be 'dict' or 'moc', got {format!r}")
+
+        moc, order = self._credible_moc(percentile, n_vertices)
+        if format == "moc":
+            return moc
+
+        contours = [
+            list(zip(c.ra.deg.tolist(), c.dec.deg.tolist()))
+            for c in moc.get_boundaries(order=order)
+        ]
+        return {
+            "superevent_id": self.superevent_id,
+            "percentile": percentile,
+            "order": order,
+            "area_deg2": moc.sky_fraction * 4 * 180**2 / np.pi,
+            "n_vertices": sum(len(c) for c in contours),
+            "contours": contours,
+        }
+
     def get_type_CBC(self):
         """Returns most probable type of CBC event, relying on classification"""
         if (not self.group == "CBC") | (self.classification is None):
@@ -500,8 +684,15 @@ class GWEvent(BaseModel):
             label, prob = self.classification.most_probable()
             return label, prob
 
+    @property
+    def identifier(self) -> Optional[str]:
+        """Best available tag for this event: the GraceDB superevent ID, falling
+        back to the GWTC catalog name for catalog-only (pre-superevent) events."""
+        return self.superevent_id or self.gw_id
+
     def save(self):
-        with open(EVENTS_DIRECTORY / f"{self.superevent_id}.json", "w") as file:
+        Path(EVENTS_DIRECTORY).mkdir(parents=True, exist_ok=True)
+        with open(Path(EVENTS_DIRECTORY) / f"{self.identifier}.json", "w") as file:
             file.write(self.model_dump_json())
 
     def plot_event(
@@ -509,19 +700,28 @@ class GWEvent(BaseModel):
         figPath: Path | str | None = None,
         circle_roi: bool = False,
         rect_roi: bool = False,
+        n_vertices: Optional[int] = None,
     ):
+        """Plot the skymap, with optional 90% credible-region overlays.
+
+        `n_vertices`, if given, overlays the MOC-based ROI from `get_roi`
+        (see its docstring) coarsened to that many boundary vertices,
+        drawn as one closed polygon per disjoint credible-region contour.
+        """
         skymap, meta = self.load_skymap()
         fig = plt.figure(figsize=(9, 4), dpi=100)
         ax = plt.axes(projection="astro hours mollweide")
         ax.grid()
         ax.imshow_hpx(skymap, cmap="cylon")
+        transform = ax.get_transform("icrs")
+        has_legend = False
 
         if circle_roi:
             roi = self.get_90_roi_circle()
             circle = SphericalCircle(
                 center=SkyCoord(roi["ra"] * u.deg, roi["dec"] * u.deg),
                 radius=roi["radius_deg"] * u.deg,
-                transform=ax.get_transform("icrs"),
+                transform=transform,
                 edgecolor="white",
                 facecolor="none",
                 linewidth=1.5,
@@ -529,7 +729,7 @@ class GWEvent(BaseModel):
                 label="90% CI",
             )
             ax.add_patch(circle)
-            ax.legend(loc="lower right")
+            has_legend = True
         if rect_roi:
             roi = self.get_90_roi_rect()
             ra_min, ra_max = roi["ra_min"], roi["ra_max"]
@@ -541,7 +741,6 @@ class GWEvent(BaseModel):
             dec_left = np.linspace(dec_min, dec_max, 100)
             dec_right = np.linspace(dec_min, dec_max, 100)
 
-            transform = ax.get_transform("icrs")
             kwargs = dict(
                 transform=transform, color="cyan", linewidth=1.5, linestyle="--"
             )
@@ -552,7 +751,18 @@ class GWEvent(BaseModel):
             ax.plot(
                 np.full(100, ra_max), dec_right, **kwargs, label="90% bbox"
             )  # right
+            has_legend = True
+        if n_vertices is not None:
+            roi = self.get_roi(percentile=90, n_vertices=n_vertices, format="dict")
+            kwargs = dict(transform=transform, color="lime", linewidth=1.5, linestyle="--")
+            for i, contour in enumerate(roi["contours"]):
+                ra, dec = zip(*contour)
+                ra, dec = ra + (ra[0],), dec + (dec[0],)  # close the polygon
+                label = f"{roi['percentile']:.0f}% MOC" if i == 0 else None
+                ax.plot(ra, dec, label=label, **kwargs)
+            has_legend = True
 
+        if has_legend:
             ax.legend(loc="lower right")
 
         for a in [ax]:
@@ -612,18 +822,25 @@ class GWTCEvent(GWEvent):
     """
 
     def __new__(
-        cls, gw_name: str | list[str], client=None, classification: bool = True
+        cls,
+        gw_name: str | list[str],
+        client=None,
+        classification: bool = True,
+        offline: bool = False,
     ):
         if isinstance(gw_name, list):
             return [
                 _build_gwevent_from_gw_name(
-                    name, client=client, classification=classification
+                    name, cls=cls, client=client, classification=classification, offline=offline
                 )
                 for name in gw_name
             ]
         return _build_gwevent_from_gw_name(
-            gw_name, client=client, classification=classification
+            gw_name, cls=cls, client=client, classification=classification, offline=offline
         )
+
+    def __init__(self, *args, **kwargs):
+        """No-op: the instance is already fully built and validated in __new__."""
 
 
 if __name__ == "__main__":
@@ -670,10 +887,15 @@ def _fetch_classification(sev: GWEvent, client) -> None:
     if not sev.pastro_ready:
         return
     try:
-        files_dict = client.files(sev.preferred_event).json()
+        # Use the superevent's file list, not the preferred (G-)event's: the
+        # latter requires GraceDB permissions beyond plain superevent read
+        # access and 401s for accounts that can still read the superevent
+        # fine, whereas the superevent's own file list already includes the
+        # p_astro.json produced for the preferred event.
+        files_dict = client.files(sev.superevent_id).json()
         for filename in files_dict:
             if filename.endswith(".json") and "p_astro" in filename:
-                data = client.files(sev.preferred_event, filename).json()
+                data = client.files(sev.superevent_id, filename).json()
                 if is_classification_json(data):
                     sev.classification = CBCClassification.model_validate(data)
                     break
@@ -681,52 +903,131 @@ def _fetch_classification(sev: GWEvent, client) -> None:
         print(f"Could not fetch classification for {sev.superevent_id}: {e}")
 
 
-def _build_gwevent(
-    superevent_id: str, client=None, classification: bool = True
+def _strip_gwtc_version(name: Optional[str]) -> Optional[str]:
+    """'GW170817-v3' -> 'GW170817', so lookups by unversioned name still match."""
+    return re.sub(r"-v\d+$", "", name) if name else name
+
+
+def _load_cached_event(identifier: str, events_dir: Path = EVENTS_DIRECTORY) -> Optional[GWEvent]:
+    """Look up a previously cached GWEvent (written by GWEvent.save()) by
+    superevent_id or GWTC name (version-suffix-insensitive). Returns None if
+    no cached record matches."""
+    direct = Path(events_dir) / f"{identifier}.json"
+    if direct.exists():
+        return GWEvent.model_validate(json.loads(direct.read_text()))
+    for path in sorted(Path(events_dir).glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            continue
+        if identifier in (data.get("superevent_id"), data.get("gw_id")):
+            return GWEvent.model_validate(data)
+        if _strip_gwtc_version(identifier) == _strip_gwtc_version(data.get("gw_id")):
+            return GWEvent.model_validate(data)
+    return None
+
+
+def _build_from_identifier(
+    identifier: str, client=None, classification: bool = True, offline: bool = False
 ) -> GWEvent:
-    if client is None:
-        client = GraceDb()
-    rep = client.superevent(superevent_id)
-    sev = GWEvent.model_validate(rep.json())
-    if classification:
-        _fetch_classification(sev, client)
-    return sev
+    """Resolve a bare identifier to a fully built event: a GWTC catalog name
+    (e.g. 'GW170817') yields a GWTCEvent, anything else is treated as a
+    GraceDB superevent ID (e.g. 'S250328ae') and yields a plain GWEvent."""
+    if identifier.upper().startswith("GW"):
+        return _build_gwevent_from_gw_name(
+            identifier, cls=GWTCEvent, client=client, classification=classification, offline=offline
+        )
+    return _build_gwevent(identifier, client=client, classification=classification, offline=offline)
+
+
+def _build_gwevent(
+    superevent_id: str, client=None, classification: bool = True, offline: bool = False
+) -> GWEvent:
+    if offline:
+        cached = _load_cached_event(superevent_id)
+        if cached is None:
+            raise RuntimeError(f"No cached event found for {superevent_id!r} (offline mode)")
+        return cached
+    try:
+        with _bounded_network_timeout():
+            if client is None:
+                client = GraceDb()
+            rep = client.superevent(superevent_id)
+            sev = GWEvent.model_validate(rep.json())
+            if classification:
+                _fetch_classification(sev, client)
+            sev.enrich_from_gwosc()
+        sev.save()
+        return sev
+    except OSError as e:
+        cached = _load_cached_event(superevent_id)
+        if cached is None:
+            raise
+        print(f"Network unavailable ({e}); falling back to cached event for {superevent_id}")
+        return cached
 
 
 def _build_gwevent_from_gw_name(
-    gw_name: str, client=None, classification: bool = True
+    gw_name: str,
+    cls: type[GWEvent] = GWEvent,
+    client=None,
+    classification: bool = True,
+    offline: bool = False,
 ) -> GWEvent:
-    if client is None:
-        client = GraceDb()
-    gwosc = GWEvent.from_gwosc(gw_name)
-    rep = client.superevent(gwosc.superevent_id)
-    sev = GWEvent.model_validate(rep.json())
-    if classification:
-        _fetch_classification(sev, client)
-    pe_fields = [
-        "gw_id",
-        "catalog",
-        "gps",
-        "far",
-        "p_astro",
-        "network_snr",
-        "mass_1",
-        "mass_2",
-        "chirp_mass",
-        "total_mass",
-        "final_mass",
-        "luminosity_distance",
-        "redshift",
-        "chi_eff",
-        "preferred_waveform",
-        "posterior_url",
-        "strain_files",
-    ]
-    for field in pe_fields:
-        val = getattr(gwosc, field)
-        if val is not None:
-            setattr(sev, field, val)
-    return sev
+    if offline:
+        cached = _load_cached_event(gw_name)
+        if cached is None:
+            raise RuntimeError(f"No cached event found for {gw_name!r} (offline mode)")
+        cached.__class__ = cls
+        return cached
+    try:
+        with _bounded_network_timeout():
+            if client is None:
+                client = GraceDb()
+            gwosc = GWEvent.from_gwosc(gw_name)
+            try:
+                rep = client.superevent(gwosc.superevent_id)
+            except HTTPError:
+                rep = client.event(gwosc.superevent_id)
+            # Always validate as the base class: cls may override __new__/__init__
+            # (see GWTCEvent), which would otherwise confuse pydantic's construction
+            # path. The instance is retagged to `cls` once fully built.
+            sev = GWEvent.model_validate(rep.json())
+            if classification:
+                _fetch_classification(sev, client)
+            pe_fields = [
+                "gw_id",
+                "catalog",
+                "gps",
+                "far",
+                "p_astro",
+                "network_snr",
+                "mass_1",
+                "mass_2",
+                "chirp_mass",
+                "total_mass",
+                "final_mass",
+                "luminosity_distance",
+                "redshift",
+                "chi_eff",
+                "preferred_waveform",
+                "posterior_url",
+                "strain_files",
+            ]
+            for field in pe_fields:
+                val = getattr(gwosc, field)
+                if val is not None:
+                    setattr(sev, field, val)
+            sev.__class__ = cls
+        sev.save()
+        return sev
+    except OSError as e:
+        cached = _load_cached_event(gw_name)
+        if cached is None:
+            raise
+        print(f"Network unavailable ({e}); falling back to cached event for {gw_name}")
+        cached.__class__ = cls
+        return cached
 
 
 def to_dataframe(events: list["GWEvent"]) -> pd.DataFrame:

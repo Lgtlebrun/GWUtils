@@ -4,7 +4,6 @@ import datetime
 
 client = GraceDb()
 
-
 def test_validate_gw_event():
     sid_exs = ["S250328ae"]
 
@@ -23,3 +22,4 @@ def test_validate_gw_event():
         assert gwevent.detectors is not None
         assert all(isinstance(d, Detector) for d in gwevent.detectors)
         assert gwevent.skymap_ready is True
+

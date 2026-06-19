@@ -1,10 +1,12 @@
 from ligo.gracedb.rest import GraceDb
-from .models_gw import GWEvent, GWTCEvent, CBCClassification, is_classification_json
+from .models_gw import GWEvent, GWTCEvent, _fetch_classification
 from urllib import request
 import re
 from collections import defaultdict
 from gwosc.api import fetch_event_json
 from gwosc import datasets
+import lal
+lal.swig_redirect_standard_output_error(False)
 
 
 def suffix_sort_key(suffix: str) -> tuple[int, str]:
@@ -91,21 +93,7 @@ def query_cbc(
 
     if classification:
         for sev in superevents:
-            if sev.pastro_ready:
-                try:
-                    files_dict = client.files(sev.preferred_event).json()
-                    for filename in files_dict.keys():
-                        if filename.endswith(".json") and "p_astro" in filename:
-                            data = client.files(sev.preferred_event, filename).json()
-                            if is_classification_json(data):
-                                sev.classification = CBCClassification.model_validate(
-                                    data
-                                )
-                                break
-                except Exception as e:
-                    print(
-                        f"Could not fetch classification for {sev.superevent_id}: {e}"
-                    )
+            _fetch_classification(sev, client)
 
     if enrich:
         for sev in superevents:
@@ -114,21 +102,26 @@ def query_cbc(
     return superevents
 
 
-def query_latest_gwtc_dataset(query: str | list[str] | None = None) -> list[str]:
-    if query is None:
-        all_datasets = datasets.find_datasets(type="event")
-        gw_datasets = [gw for gw in all_datasets if gw.startswith("GW")]
-    elif isinstance(query, list):
-        all_datasets = datasets.query_events(select=query)
-        gw_datasets = [gw for gw in all_datasets if gw.startswith("GW")]
-    elif query.startswith("GW"):
-        all_datasets = datasets.find_datasets(type="event")
-        gw_datasets = [gw for gw in all_datasets if gw.startswith(query)]
-    else:
-        all_datasets = datasets.query_events(select=query)
-        gw_datasets = [gw for gw in all_datasets if gw.startswith("GW")]
+def query_latest_gwtc_dataset(query: str | list[str] | None = None, max_attempts =3) -> list[str]:
 
-    return _keep_latest_versions(gw_datasets)
+    for attempt in range(1, max_attempts+1):
+        try :
+            if query is None:
+                all_datasets = datasets.find_datasets(type="event")
+                gw_datasets = [gw for gw in all_datasets if gw.startswith("GW")]
+            elif isinstance(query, list):
+                all_datasets = datasets.query_events(select=query)
+                gw_datasets = [gw for gw in all_datasets if gw.startswith("GW")]
+            elif query.startswith("GW"):
+                all_datasets = datasets.find_datasets(type="event")
+                gw_datasets = [gw for gw in all_datasets if gw.startswith(query)]
+            else:
+                all_datasets = datasets.query_events(select=query)
+                gw_datasets = [gw for gw in all_datasets if gw.startswith("GW")]
+
+            return _keep_latest_versions(gw_datasets)
+        except Exception as e :
+            print(f"Error while querying (attempt {attempt}/{max_attempts})")
 
 
 def query_gwtc_events(
@@ -137,8 +130,10 @@ def query_gwtc_events(
     """Query GWTC and return fully built GWTCEvent objects, deduplicated by superevent_id."""
     from .models_gw import GWTCEvent
 
-    names = query_latest_gwtc_dataset(query)
-    events = GWTCEvent(names, client=client, classification=classification)
+    # names = query_latest_gwtc_dataset(query)
+    print("DEBUG : trying to instantiate a GWTCEvent")
+    events = GWTCEvent(query, client=client, classification=classification)
+    print("DEBUG : GWTCEvent instantiated")
 
     # Deduplicate by superevent_id, keeping the one with the most GWOSC data
     seen = {}

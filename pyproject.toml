@@ -27,6 +27,7 @@ dependencies = [
     "ligo",
     "ligo.skymap",
     "gwosc",
+    "mocpy",
 ]
 
 # Optional dependency groups
