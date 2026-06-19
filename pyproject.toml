@@ -30,7 +30,7 @@ dependencies = [
     "gwosc",
     "mocpy",
     "matplotlib>=3.5",
-    "lal",
+    "lalsuite",
 ]
 
 # Optional dependency groups
