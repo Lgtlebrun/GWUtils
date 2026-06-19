@@ -988,11 +988,22 @@ def _build_gwevent_from_gw_name(
             try:
                 rep = client.superevent(gwosc.superevent_id)
             except HTTPError:
-                rep = client.event(gwosc.superevent_id)
+                try:
+                    rep = client.event(gwosc.superevent_id)
+                except HTTPError as e:
+                    # Pre-superevent (GWTC-1, O1/O2) events resolve to a bare
+                    # G-event in GraceDB, and reading individual G-events
+                    # requires GraceDB permissions beyond plain public read
+                    # access (unlike superevents) -- 401s even for fully
+                    # public, already-released events. GWOSC alone already
+                    # has everything we need for those, so fall back to it
+                    # instead of failing the whole lookup.
+                    print(f"No GraceDB record accessible for {gw_name} ({e}); using GWOSC catalog data only")
+                    rep = None
             # Always validate as the base class: cls may override __new__/__init__
             # (see GWTCEvent), which would otherwise confuse pydantic's construction
             # path. The instance is retagged to `cls` once fully built.
-            sev = GWEvent.model_validate(rep.json())
+            sev = GWEvent.model_validate(rep.json()) if rep is not None else gwosc
             if classification:
                 _fetch_classification(sev, client)
             pe_fields = [
