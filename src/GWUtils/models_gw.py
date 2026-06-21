@@ -149,9 +149,14 @@ class GWEvent(BaseModel):
     far: Optional[float] = None
     p_astro: Optional[float] = None
 
-    # Status flags 
+    # Status flags
     skymap_ready: bool = False
     pastro_ready: bool = False
+    # None = not yet checked; True/False = cached result of the last GWOSC
+    # membership check (see resolve_is_public). Round-trips through
+    # save()/model_validate() like any other field, so once cached it's
+    # available offline without re-querying GWOSC.
+    is_public: Optional[bool] = None
 
     # Classification
     classification: Optional[CBCClassification] = None
@@ -405,6 +410,22 @@ class GWEvent(BaseModel):
             return None
         candidates.sort(key=lambda c: int(c.rsplit("-v", 1)[1]) if "-v" in c else 0)
         return candidates[-1]
+
+    def resolve_is_public(self, force: bool = False) -> bool:
+        """Check (and cache) whether GWOSC publicly lists an event at this GPS time.
+
+        The result is cached on `is_public`, so repeated calls -- including
+        across runs, if persisted via `.save()` -- don't re-hit GWOSC. Pass
+        force=True to bypass the cache and re-query.
+        """
+        if self.is_public is not None and not force:
+            return self.is_public
+        if self.t_0 is None:
+            self.is_public = False
+        else:
+            gps = Time(self.t_0).gps
+            self.is_public = bool(datasets.find_datasets(type="event", segment=(gps - 1, gps + 1)))
+        return self.is_public
 
     def enrich_from_gwosc(self) -> "GWEvent":
         """
