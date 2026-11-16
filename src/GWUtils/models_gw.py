@@ -722,18 +722,37 @@ class GWEvent(BaseModel):
         circle_roi: bool = False,
         rect_roi: bool = False,
         n_vertices: Optional[int] = None,
+        ax=None,
+        skymap: bool = True,
+        markers: Optional[list[dict]] = None,
+        title: Optional[str] = None,
+        show: bool = True,
+        legend_kwargs: Optional[dict] = None,
     ):
         """Plot the skymap, with optional 90% credible-region overlays.
 
         `n_vertices`, if given, overlays the MOC-based ROI from `get_roi`
         (see its docstring) coarsened to that many boundary vertices,
         drawn as one closed polygon per disjoint credible-region contour.
+
+        `ax` draws on the given "astro ... mollweide" axes instead of creating a
+        new figure. `skymap=False` skips loading and drawing the sky map (empty
+        sphere: for events with no map, e.g. only a known true position).
+        `markers` is a list of dicts {"ra": deg, "dec": deg, "label": str, ...}
+        drawn as points (extra keys are passed to `ax.plot`, e.g. color,
+        marker). `title` overrides the default title; `show=False` does not
+        call plt.show(). `legend_kwargs` are the keywords of `ax.legend` (default
+        {"loc": "lower right"}).
         """
-        skymap, meta = self.load_skymap()
-        fig = plt.figure(figsize=(9, 4), dpi=100)
-        ax = plt.axes(projection="astro hours mollweide")
+        if ax is None:
+            fig = plt.figure(figsize=(9, 4), dpi=100)
+            ax = plt.axes(projection="astro hours mollweide")
+        else:
+            fig = ax.figure
         ax.grid()
-        ax.imshow_hpx(skymap, cmap="cylon")
+        if skymap:
+            skymap_data, meta = self.load_skymap()
+            ax.imshow_hpx(skymap_data, cmap="cylon")
         transform = ax.get_transform("icrs")
         has_legend = False
 
@@ -783,8 +802,16 @@ class GWEvent(BaseModel):
                 ax.plot(ra, dec, label=label, **kwargs)
             has_legend = True
 
+        for marker in markers or []:
+            marker = dict(marker)
+            ra, dec = marker.pop("ra"), marker.pop("dec")
+            marker.setdefault("linestyle", "none")
+            marker.setdefault("marker", "*")
+            ax.plot(ra, dec, transform=transform, **marker)
+            has_legend = has_legend or marker.get("label") is not None
+
         if has_legend:
-            ax.legend(loc="lower right")
+            ax.legend(**(legend_kwargs or {"loc": "lower right"}))
 
         for a in [ax]:
             a.set_facecolor("white")
@@ -792,11 +819,12 @@ class GWEvent(BaseModel):
                 a.coords[key].set_auto_axislabel(False)
 
         name = self.gw_id if self.gw_id else self.superevent_id
-        ax.set_title(name)
+        ax.set_title(title if title is not None else name)
 
         if figPath:
             fig.savefig(figPath, dpi=300)
-        plt.show()
+        if show:
+            plt.show()
         return fig, ax
 
     def to_dict(self) -> dict:
